@@ -5,7 +5,7 @@ export const storage = defineStorage({
   isDefault: true,
   access: (allow) => ({
     'projects/wilders-gap/*': [
-      allow.groups(['wilders-gap']).to(['read', 'write']),
+      allow.groups(['wilders-gap']).to(['read', 'write', 'delete']),
     ],
   }),
 });

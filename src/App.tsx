@@ -12,9 +12,13 @@ import './App.css';
 
 import config from '../amplify_outputs.json';
 import { Amplify } from 'aws-amplify';
-import { Authenticator, Button } from '@aws-amplify/ui-react';
+import { Authenticator, Button, Menu, MenuItem } from '@aws-amplify/ui-react';
 import { getUrl as getStorageUrl } from '@aws-amplify/storage/internals';
-import { getUrl as getPublicUrl } from 'aws-amplify/storage';
+import {
+  getUrl as getPublicUrl,
+  list as listStorageItems,
+  remove as removeStorageItem,
+} from 'aws-amplify/storage';
 import JSZip from 'jszip';
 import { useEffect, useMemo, useState, type ComponentProps } from 'react';
 Amplify.configure(config);
@@ -64,6 +68,63 @@ const setDownloadBatchKeys = (keys: string[]) => {
   }
 
   downloadBatch = { keys: [...keys] };
+};
+
+const ensureFolderPath = (key: string) => (key.endsWith('/') ? key : `${key}/`);
+
+const resolveItemPath = (item: { path?: string; key?: string }) =>
+  item.path ?? item.key ?? '';
+
+const isNotFoundError = (error: unknown) => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const maybeNamedError = error as Error & { name?: string };
+  if (maybeNamedError.name === 'NoSuchKey') {
+    return true;
+  }
+  return /NoSuchKey/i.test(error.message ?? '');
+};
+
+const removeObjectIfExists = async (path: string) => {
+  if (!path) {
+    return;
+  }
+  try {
+    await removeStorageItem({ path });
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+};
+
+const deleteFolderContents = async (folderKey: string) => {
+  const normalizedKey = ensureFolderPath(folderKey);
+  const { items = [] } = await listStorageItems({
+    path: normalizedKey,
+    options: { listAll: true },
+  });
+  const pathsToDelete = new Set<string>();
+  items.forEach((item) => {
+    const itemPath = resolveItemPath(item as { path?: string; key?: string });
+    if (itemPath) {
+      pathsToDelete.add(itemPath);
+    }
+  });
+  pathsToDelete.add(normalizedKey);
+  for (const path of pathsToDelete) {
+    await removeObjectIfExists(path);
+  }
+};
+
+const deleteFilesAndFolders = async (files: string[], folders: string[]) => {
+  for (const key of files) {
+    await removeObjectIfExists(key);
+  }
+  for (const folderKey of folders) {
+    await deleteFolderContents(folderKey);
+  }
 };
 
 const IMAGE_EXTENSIONS = [
@@ -280,15 +341,25 @@ type StorageBrowserItem = {
 type FolderItem = StorageBrowserItem & { type: 'FOLDER' };
 type FileItem = StorageBrowserItem & { type: 'FILE' };
 
+type ActionMenuItem = {
+  actionType: string;
+  label?: string;
+  icon?: string;
+  isDisabled?: boolean;
+  isHidden?: boolean;
+};
+
 interface GalleryGridProps {
   folders: FolderItem[];
   files: FileItem[];
   thumbnails: Record<string, string | null>;
   selectedIds: Set<string>;
+  selectedFolderIds: Set<string>;
   activeFileId?: string;
   onOpenFolder: (folder: FolderItem) => void;
   onPreviewFile: (file: FileItem) => void;
   onToggleSelection: (file: FileItem) => void;
+  onToggleFolderSelection: (folder: FolderItem) => void;
   onDownloadFile: (file: FileItem) => void;
 }
 
@@ -297,10 +368,12 @@ const GalleryGrid = ({
   files,
   thumbnails,
   selectedIds,
+  selectedFolderIds,
   activeFileId,
   onOpenFolder,
   onPreviewFile,
   onToggleSelection,
+  onToggleFolderSelection,
   onDownloadFile,
 }: GalleryGridProps) => {
   if (!folders.length && !files.length) {
@@ -313,24 +386,41 @@ const GalleryGrid = ({
 
   return (
     <div className="storage-gallery-grid">
-      {folders.map((folder) => (
-        <button
-          key={folder.id}
-          className="storage-gallery-card storage-gallery-card--folder"
-          type="button"
-          onClick={() => onOpenFolder(folder)}
-        >
-          <div className="storage-gallery-card__thumb">
-            <span aria-hidden={true}>📁</span>
+      {folders.map((folder) => {
+        const isSelected = selectedFolderIds.has(folder.id);
+        return (
+          <div
+            key={folder.id}
+            className="storage-gallery-card storage-gallery-card--folder"
+          >
+            <button
+              type="button"
+              className="storage-gallery-card__select"
+              aria-pressed={isSelected}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleFolderSelection(folder);
+              }}
+            >
+              <input type="checkbox" readOnly checked={isSelected} />
+              <span>{isSelected ? 'Selected' : 'Select'}</span>
+            </button>
+            <button
+              type="button"
+              className="storage-gallery-card__thumb storage-gallery-card__thumb--folder"
+              onClick={() => onOpenFolder(folder)}
+            >
+              <span aria-hidden={true}>📁</span>
+            </button>
+            <div className="storage-gallery-card__meta">
+              <span className="storage-gallery-card__name">
+                {getFileName(folder.key)}
+              </span>
+              <span className="storage-gallery-card__detail">Folder</span>
+            </div>
           </div>
-          <div className="storage-gallery-card__meta">
-            <span className="storage-gallery-card__name">
-              {getFileName(folder.key)}
-            </span>
-            <span className="storage-gallery-card__detail">Folder</span>
-          </div>
-        </button>
-      ))}
+        );
+      })}
       {files.map((file) => {
         const thumbnail = thumbnails[file.key];
         const isSelected = selectedIds.has(file.id);
@@ -390,6 +480,63 @@ const GalleryGrid = ({
   );
 };
 
+interface GalleryActionsMenuProps {
+  actions: ActionMenuItem[];
+  isLoading: boolean;
+  hasSelection: boolean;
+  isDeleting: boolean;
+  onActionSelect: (actionType: string) => void;
+  onDeleteSelected: () => void;
+}
+
+const GalleryActionsMenu = ({
+  actions,
+  isLoading,
+  hasSelection,
+  isDeleting,
+  onActionSelect,
+  onDeleteSelected,
+}: GalleryActionsMenuProps) => {
+  const visibleActions = actions.filter((item) => !item.isHidden);
+  const hasVisibleActions = visibleActions.length > 0;
+  const isMenuDisabled =
+    isLoading || (!hasVisibleActions && !hasSelection && !isDeleting);
+
+  return (
+    <Menu
+      isDisabled={isMenuDisabled}
+      trigger={
+        <Button ariaLabel="Menu Toggle" size="small">
+          Actions
+        </Button>
+      }
+    >
+      {visibleActions.map((item) => (
+        <MenuItem
+          key={item.actionType}
+          size="small"
+          isDisabled={item.isDisabled}
+          onClick={() => onActionSelect(item.actionType)}
+        >
+          {item.label ?? item.actionType}
+        </MenuItem>
+      ))}
+      <MenuItem
+        size="small"
+        isDisabled={!hasSelection || isDeleting}
+        onClick={() => {
+          if (!hasSelection || isDeleting) {
+            return;
+          }
+          onDeleteSelected();
+        }}
+      >
+        {isDeleting ? 'Deleting…' : 'Delete selected'}
+      </MenuItem>
+    </Menu>
+  );
+};
+
 const DefaultLocationDetailView = StorageBrowser.LocationDetailView;
 
 type DefaultLocationDetailViewProps = ComponentProps<
@@ -403,14 +550,18 @@ const GalleryLocationDetailView = ({
 }: DefaultLocationDetailViewProps & { onSignOut?: () => void }) => {
   const state = useView('LocationDetail');
   const {
+    actionItems = [],
     pageItems,
     fileDataItems,
     location,
+    isLoading,
+    onRefresh,
     onNavigate,
     onSelectActiveFile,
     onSelect,
     onDownload,
     onToggleSelectAll,
+    onActionSelect,
     hasError,
   } = state;
   const folders = useMemo(
@@ -428,6 +579,39 @@ const GalleryLocationDetailView = ({
     () => new Set(fileDataItems?.map((item) => item.id)),
     [fileDataItems],
   );
+  const [selectedFolderIds, setSelectedFolderIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteMessage, setDeleteMessage] = useState<string | null>(null);
+  const selectedFileItems = fileDataItems ?? [];
+  const selectedFolderItems = useMemo(
+    () => folders.filter((folder) => selectedFolderIds.has(folder.id)),
+    [folders, selectedFolderIds],
+  );
+  const hasSelection =
+    selectedFileItems.length > 0 || selectedFolderItems.length > 0;
+  useEffect(() => {
+    setSelectedFolderIds(new Set());
+    setDeleteError(null);
+    setDeleteMessage(null);
+  }, [location.current?.id, location.path]);
+  useEffect(() => {
+    setSelectedFolderIds((prev) => {
+      if (!prev.size) {
+        return prev;
+      }
+      const visibleIds = new Set(folders.map((folder) => folder.id));
+      const next = new Set(
+        [...prev].filter((id) => visibleIds.has(id)),
+      );
+      if (next.size === prev.size) {
+        return prev;
+      }
+      return next;
+    });
+  }, [folders]);
 
   const handleFolderOpen = (folder: FolderItem) => {
     if (!location.current) {
@@ -442,12 +626,123 @@ const GalleryLocationDetailView = ({
     onSelect(selectedIds.has(file.id), file as any);
   };
 
+  const handleFolderSelectionToggle = (folder: FolderItem) => {
+    setSelectedFolderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(folder.id)) {
+        next.delete(folder.id);
+      } else {
+        next.add(folder.id);
+      }
+      return next;
+    });
+  };
+
   const handlePreviewFile = (file: FileItem) => {
     onSelectActiveFile(file as any);
   };
 
   const handleDownloadFile = (file: FileItem) => {
     onDownload(file as any);
+  };
+
+  const handleSelectAll = () => {
+    onToggleSelectAll();
+    setSelectedFolderIds((prev) => {
+      if (!folders.length) {
+        return prev;
+      }
+      const next = new Set(prev);
+      const areAllSelected = folders.every((folder) => next.has(folder.id));
+      if (areAllSelected) {
+        folders.forEach((folder) => next.delete(folder.id));
+      } else {
+        folders.forEach((folder) => next.add(folder.id));
+      }
+      return next;
+    });
+  };
+
+  const getDeleteConfirmationMessage = (
+    files: typeof selectedFileItems,
+    foldersToDelete: FolderItem[],
+  ) => {
+    const fileCount = files.length;
+    const folderCount = foldersToDelete.length;
+    const total = fileCount + folderCount;
+    if (!total) {
+      return '';
+    }
+    if (total === 1) {
+      if (folderCount === 1) {
+        return `Delete folder "${getFileName(
+          foldersToDelete[0].key,
+        )}" and all of its contents?`;
+      }
+      return `Delete file "${getFileName(files[0].key)}"?`;
+    }
+    return `Delete ${total} selected items?`;
+  };
+
+  const runDeletion = async (
+    filesToDelete: typeof selectedFileItems,
+    foldersToDelete: FolderItem[],
+  ) => {
+    if (!filesToDelete.length && !foldersToDelete.length) {
+      return;
+    }
+    setDeleteError(null);
+    setDeleteMessage(null);
+    setIsDeleting(true);
+    try {
+      await deleteFilesAndFolders(
+        filesToDelete.map((file) => file.key),
+        foldersToDelete.map((folder) => folder.key),
+      );
+      filesToDelete.forEach((file) => {
+        onSelect(true, file as any);
+      });
+      if (foldersToDelete.length) {
+        setSelectedFolderIds((prev) => {
+          const next = new Set(prev);
+          foldersToDelete.forEach((folder) => next.delete(folder.id));
+          return next;
+        });
+      }
+      onRefresh();
+      const count = filesToDelete.length + foldersToDelete.length;
+      setDeleteMessage(
+        `Deleted ${count} item${count === 1 ? '' : 's'}.`,
+      );
+    } catch (error) {
+      setDeleteError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to delete selected items.',
+      );
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleDeleteSelected = () => {
+    const filesToDelete = [...selectedFileItems];
+    const foldersToDelete = [...selectedFolderItems];
+    if (!filesToDelete.length && !foldersToDelete.length) {
+      return;
+    }
+    const message = getDeleteConfirmationMessage(
+      filesToDelete,
+      foldersToDelete,
+    );
+    if (
+      typeof window !== 'undefined' &&
+      message &&
+      !window.confirm(message)
+    ) {
+      return;
+    }
+    void runDeletion(filesToDelete, foldersToDelete);
   };
 
   const composedClassName = [
@@ -478,17 +773,34 @@ const GalleryLocationDetailView = ({
           </div>
           <DefaultLocationDetailView.Pagination />
           <DefaultLocationDetailView.Refresh />
-          <DefaultLocationDetailView.ActionsList />
+          <GalleryActionsMenu
+            actions={actionItems as ActionMenuItem[]}
+            isLoading={isLoading}
+            hasSelection={hasSelection}
+            isDeleting={isDeleting}
+            onActionSelect={onActionSelect}
+            onDeleteSelected={handleDeleteSelected}
+          />
         </div>
         <div className="storage-gallery-view__select-all-wrapper">
           <button
             type="button"
             className="storage-gallery-view__select-all"
-            onClick={onToggleSelectAll}
+            onClick={handleSelectAll}
           >
             Select all
           </button>
         </div>
+        {deleteError ? (
+          <p className="storage-gallery-view__delete-message storage-gallery-view__delete-message--error">
+            {deleteError}
+          </p>
+        ) : null}
+        {!deleteError && deleteMessage ? (
+          <p className="storage-gallery-view__delete-message">
+            {deleteMessage}
+          </p>
+        ) : null}
         {!hasError && (
           <div className="amplify-storage-browser__content-with-preview storage-gallery-view__content">
             <DefaultLocationDetailView.DropZone>
@@ -499,10 +811,12 @@ const GalleryLocationDetailView = ({
                   files={files}
                   thumbnails={thumbnails}
                   selectedIds={selectedIds}
+                  selectedFolderIds={selectedFolderIds}
                   activeFileId={state.activeFile?.id}
                   onOpenFolder={handleFolderOpen}
                   onPreviewFile={handlePreviewFile}
                   onToggleSelection={handleSelectionToggle}
+                  onToggleFolderSelection={handleFolderSelectionToggle}
                   onDownloadFile={handleDownloadFile}
                 />
               </div>
